@@ -686,6 +686,11 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
         let gap = curr_item.x - prev_end_x;
         let font_size = prev_item.font_size;
 
+        // Never join across column-scale gaps
+        if gap > font_size * 3.0 {
+            return false;
+        }
+
         // When items perfectly touch (gap ≈ 0) and both are multi-character,
         // they are likely separate words from different text operators (CID fonts).
         // Single-character items (per-glyph positioning) should still be joined.
@@ -777,6 +782,29 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
 
         // With accurate widths, a gap < 15% of font size means glyphs are
         // adjacent (same word). Anything larger is a deliberate space.
+        // For multi-char items with a lowercase→lowercase junction, use a
+        // slightly wider threshold (0.18) to avoid mid-word space injection
+        // with imprecise CID font metrics (e.g. "enterta"+"inment").
+        // All-caps or mixed-case junctions keep the tighter 0.15 threshold
+        // to preserve word boundaries (e.g. "LCOE"+"WITH").
+        if prev_item.text.trim().chars().count() >= 2 && curr_item.text.trim().chars().count() >= 2
+        {
+            let prev_ends_lower = prev_item
+                .text
+                .trim()
+                .chars()
+                .last()
+                .map_or(false, |c| c.is_lowercase());
+            let curr_starts_lower = curr_item
+                .text
+                .trim()
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_lowercase());
+            if prev_ends_lower && curr_starts_lower {
+                return gap < font_size * 0.18;
+            }
+        }
         return gap < font_size * 0.15;
     }
 
@@ -791,6 +819,11 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
 
     // Calculate gap between items
     let gap = curr_item.x - prev_end_x;
+
+    // Never join across column-scale gaps (fallback path)
+    if gap > char_width * 6.0 {
+        return false;
+    }
 
     // CJK text: always join adjacent items — CJK languages don't use spaces between words.
     // The Latin case-based heuristics below would incorrectly insert spaces within CJK words.
@@ -2261,18 +2294,27 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
                 }
             }
 
-            // Process each column's items independently, preserving column identity
-            let mut per_column_lines: Vec<Vec<TextLine>> = Vec::new();
-            for column in &columns {
-                let col_items: Vec<TextItem> = column_items
-                    .iter()
-                    .filter(|i| {
-                        let center = i.x + effective_width(i) / 2.0;
-                        center >= column.x_min && center < column.x_max
-                    })
-                    .cloned()
-                    .collect();
+            // Process each column's items independently, preserving column identity.
+            // Assign each item to the column with greatest horizontal overlap
+            // (instead of center-point) to avoid gutter mis-assignment.
+            let mut col_buckets: Vec<Vec<TextItem>> = vec![Vec::new(); columns.len()];
+            for item in &column_items {
+                let item_left = item.x;
+                let item_right = item.x + effective_width(item);
+                let mut best_col = 0;
+                let mut best_overlap = f32::NEG_INFINITY;
+                for (ci, col) in columns.iter().enumerate() {
+                    let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+                    if overlap > best_overlap {
+                        best_overlap = overlap;
+                        best_col = ci;
+                    }
+                }
+                col_buckets[best_col].push(item.clone());
+            }
 
+            let mut per_column_lines: Vec<Vec<TextLine>> = Vec::new();
+            for col_items in col_buckets {
                 let lines = group_single_column(col_items);
                 per_column_lines.push(lines);
             }
