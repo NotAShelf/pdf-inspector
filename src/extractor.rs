@@ -772,13 +772,13 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
                 .trim()
                 .chars()
                 .last()
-                .map_or(false, |c| c.is_lowercase());
+                .is_some_and(|c| c.is_lowercase());
             let curr_starts_lower = curr_item
                 .text
                 .trim()
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_lowercase());
+                .is_some_and(|c| c.is_lowercase());
             if prev_ends_lower && curr_starts_lower {
                 return gap < font_size * 0.18;
             }
