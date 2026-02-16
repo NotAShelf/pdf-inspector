@@ -72,6 +72,8 @@ pub fn detect_pdf_type_with_config<P: AsRef<Path>>(
     path: P,
     config: DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    crate::validate_pdf_file(&path)?;
+
     // First, load metadata only (fast operation)
     let metadata = Document::load_metadata(&path)?;
 
@@ -92,6 +94,8 @@ pub fn detect_pdf_type_mem_with_config(
     buffer: &[u8],
     config: DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
+
     // Load metadata first (fast)
     let metadata = Document::load_metadata_mem(buffer)?;
 

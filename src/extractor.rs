@@ -842,12 +842,14 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
 
 /// Extract text from PDF file as plain string
 pub fn extract_text<P: AsRef<Path>>(path: P) -> Result<String, PdfError> {
+    crate::validate_pdf_file(&path)?;
     let doc = Document::load(path)?;
     extract_text_from_doc(&doc)
 }
 
 /// Extract text from PDF memory buffer
 pub fn extract_text_mem(buffer: &[u8]) -> Result<String, PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
     let doc = Document::load_mem(buffer)?;
     extract_text_from_doc(&doc)
 }
@@ -865,6 +867,7 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
 pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
     // Read the raw PDF bytes for ToUnicode extraction
     let pdf_bytes = std::fs::read(path.as_ref())?;
+    crate::validate_pdf_bytes(&pdf_bytes)?;
     let font_cmaps = FontCMaps::from_pdf_bytes(&pdf_bytes);
 
     let doc = Document::load_mem(&pdf_bytes)?;
@@ -873,6 +876,7 @@ pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextIt
 
 /// Extract text with positions from memory buffer
 pub fn extract_text_with_positions_mem(buffer: &[u8]) -> Result<Vec<TextItem>, PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
     // Extract ToUnicode CMaps from raw PDF bytes
     let font_cmaps = FontCMaps::from_pdf_bytes(buffer);
 

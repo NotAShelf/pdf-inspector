@@ -4,7 +4,7 @@ use pdf_inspector::detector::DetectionConfig;
 use pdf_inspector::extractor::{group_into_lines, TextLine};
 use pdf_inspector::{
     detect_pdf_type, extract_text, extract_text_with_positions, to_markdown, MarkdownOptions,
-    PdfType, TextItem,
+    PdfError, PdfType, TextItem,
 };
 
 // Helper to create test TextItems
@@ -729,4 +729,110 @@ fn test_trailing_newline() {
     let md = to_markdown(text, MarkdownOptions::default());
     assert!(md.ends_with('\n'));
     assert!(!md.ends_with("\n\n"));
+}
+
+// ============================================================================
+// NotAPdf Detection Tests
+// ============================================================================
+
+/// Helper: assert that an error is NotAPdf and its message contains the given substring.
+fn assert_not_a_pdf(result: Result<impl std::fmt::Debug, PdfError>, expected_hint: &str) {
+    match result {
+        Err(PdfError::NotAPdf(msg)) => {
+            assert!(
+                msg.to_lowercase().contains(&expected_hint.to_lowercase()),
+                "Expected hint '{}' in NotAPdf message, got: '{}'",
+                expected_hint,
+                msg,
+            );
+        }
+        other => panic!(
+            "Expected Err(NotAPdf) containing '{}', got: {:?}",
+            expected_hint, other,
+        ),
+    }
+}
+
+#[test]
+fn test_not_a_pdf_html_input() {
+    let html = b"<!DOCTYPE html><html><body>Hello</body></html>";
+    let result = pdf_inspector::process_pdf_mem(html);
+    assert_not_a_pdf(result, "HTML");
+}
+
+#[test]
+fn test_not_a_pdf_xml_input() {
+    let xml = b"<?xml version=\"1.0\"?><root><item>data</item></root>";
+    let result = pdf_inspector::process_pdf_mem(xml);
+    assert_not_a_pdf(result, "XML");
+}
+
+#[test]
+fn test_not_a_pdf_json_input() {
+    let json = b"{\"error\": \"download failed\"}";
+    let result = pdf_inspector::process_pdf_mem(json);
+    assert_not_a_pdf(result, "JSON");
+}
+
+#[test]
+fn test_not_a_pdf_plain_text_input() {
+    let text = b"This is a plain text file that is not a PDF at all.";
+    let result = pdf_inspector::process_pdf_mem(text);
+    assert_not_a_pdf(result, "plain text");
+}
+
+#[test]
+fn test_not_a_pdf_empty_buffer() {
+    let result = pdf_inspector::process_pdf_mem(b"");
+    assert_not_a_pdf(result, "empty");
+}
+
+#[test]
+fn test_valid_pdf_header_not_rejected() {
+    // A truncated but valid PDF header should NOT produce NotAPdf —
+    // it should fail with Parse or InvalidStructure instead.
+    let truncated_pdf = b"%PDF-1.4\ntruncated content";
+    let result = pdf_inspector::process_pdf_mem(truncated_pdf);
+    match result {
+        Err(PdfError::NotAPdf(_)) => panic!("Valid PDF header should not be rejected as NotAPdf"),
+        _ => {} // Parse or InvalidStructure is fine
+    }
+}
+
+#[test]
+fn test_bom_prefixed_pdf_header_not_rejected() {
+    // UTF-8 BOM + %PDF- should still be recognized as a PDF
+    let mut bom_pdf = vec![0xEF, 0xBB, 0xBF];
+    bom_pdf.extend_from_slice(b"%PDF-1.7\ntruncated");
+    let result = pdf_inspector::process_pdf_mem(&bom_pdf);
+    match result {
+        Err(PdfError::NotAPdf(_)) => {
+            panic!("BOM-prefixed PDF header should not be rejected as NotAPdf")
+        }
+        _ => {} // Parse or InvalidStructure is fine
+    }
+}
+
+#[test]
+fn test_not_a_pdf_detect_pdf_type_mem() {
+    // Verify detect_pdf_type_mem is also guarded
+    let html = b"<html><head><title>Not a PDF</title></head></html>";
+    let result = pdf_inspector::detector::detect_pdf_type_mem(html);
+    assert_not_a_pdf(result, "HTML");
+}
+
+#[test]
+fn test_not_a_pdf_extract_text_with_positions_mem() {
+    // Verify extract_text_with_positions_mem is also guarded
+    let html = b"<!DOCTYPE html><html><body>content</body></html>";
+    let result = pdf_inspector::extractor::extract_text_with_positions_mem(html);
+    assert_not_a_pdf(result, "HTML");
+}
+
+#[test]
+fn test_not_a_pdf_extract_text_mem() {
+    // Verify extract_text_mem is also guarded
+    let xml = b"<?xml version=\"1.0\"?><data/>";
+    let result = pdf_inspector::extractor::extract_text_mem(xml);
+    assert_not_a_pdf(result, "XML");
 }

@@ -42,6 +42,8 @@ pub struct PdfProcessResult {
 pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError> {
     let start = std::time::Instant::now();
 
+    validate_pdf_file(&path)?;
+
     // Step 1: Smart detection (fast, no full load)
     let detection = detect_pdf_type(&path)?;
 
@@ -90,6 +92,8 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
 /// Process PDF from memory buffer
 pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
     let start = std::time::Instant::now();
+
+    validate_pdf_bytes(buffer)?;
 
     // Step 1: Smart detection (fast, no full load)
     let detection = detector::detect_pdf_type_mem(buffer)?;
@@ -142,10 +146,148 @@ pub enum PdfError {
     Encrypted,
     #[error("Invalid PDF structure")]
     InvalidStructure,
+    #[error("Not a PDF: {0}")]
+    NotAPdf(String),
 }
 
 impl From<lopdf::Error> for PdfError {
     fn from(e: lopdf::Error) -> Self {
-        PdfError::Parse(e.to_string())
+        match e {
+            lopdf::Error::IO(io_err) => PdfError::Io(io_err),
+            lopdf::Error::Decryption(_)
+            | lopdf::Error::InvalidPassword
+            | lopdf::Error::AlreadyEncrypted
+            | lopdf::Error::UnsupportedSecurityHandler(_) => PdfError::Encrypted,
+            lopdf::Error::Parse(ref pe) if pe.to_string().contains("invalid file header") => {
+                PdfError::NotAPdf("invalid PDF file header".to_string())
+            }
+            lopdf::Error::MissingXrefEntry
+            | lopdf::Error::Xref(_)
+            | lopdf::Error::IndirectObject { .. }
+            | lopdf::Error::ObjectIdMismatch
+            | lopdf::Error::InvalidObjectStream(_)
+            | lopdf::Error::InvalidOffset(_) => PdfError::InvalidStructure,
+            other => PdfError::Parse(other.to_string()),
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PDF validation helpers
+// ---------------------------------------------------------------------------
+
+/// Strip UTF-8 BOM and leading ASCII whitespace from a byte slice.
+fn strip_bom_and_whitespace(bytes: &[u8]) -> &[u8] {
+    let b = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &bytes[3..]
+    } else {
+        bytes
+    };
+    let start = b
+        .iter()
+        .position(|&c| !c.is_ascii_whitespace())
+        .unwrap_or(b.len());
+    &b[start..]
+}
+
+/// Case-insensitive prefix check on byte slices.
+fn starts_with_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack[..needle.len()]
+        .iter()
+        .zip(needle)
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Try to identify what kind of file the bytes represent.
+fn detect_file_type_hint(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "file is empty".to_string();
+    }
+
+    let trimmed = strip_bom_and_whitespace(bytes);
+
+    // HTML
+    if starts_with_ci(trimmed, b"<!doctype html")
+        || starts_with_ci(trimmed, b"<html")
+        || starts_with_ci(trimmed, b"<head")
+        || starts_with_ci(trimmed, b"<body")
+    {
+        return "file appears to be HTML".to_string();
+    }
+
+    // XML (but not HTML)
+    if trimmed.starts_with(b"<?xml") || trimmed.starts_with(b"<") {
+        // Distinguish generic XML from HTML-like XML
+        if starts_with_ci(trimmed, b"<?xml") {
+            return "file appears to be XML".to_string();
+        }
+        // Other tags that look like XML
+        if trimmed.starts_with(b"<") && !trimmed.starts_with(b"<%") {
+            return "file appears to be XML".to_string();
+        }
+    }
+
+    // JSON
+    if trimmed.starts_with(b"{") || trimmed.starts_with(b"[") {
+        return "file appears to be JSON".to_string();
+    }
+
+    // PNG
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return "file appears to be a PNG image".to_string();
+    }
+
+    // JPEG
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "file appears to be a JPEG image".to_string();
+    }
+
+    // ZIP / Office documents
+    if bytes.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
+        return "file appears to be a ZIP archive (possibly an Office document)".to_string();
+    }
+
+    // If it looks like mostly printable ASCII/UTF-8, call it plain text
+    let sample = &bytes[..bytes.len().min(512)];
+    let printable = sample
+        .iter()
+        .filter(|&&b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+        .count();
+    if printable > sample.len() * 3 / 4 {
+        return "file appears to be plain text".to_string();
+    }
+
+    "file is not a PDF".to_string()
+}
+
+/// Validate that a byte buffer looks like a PDF (has `%PDF-` magic).
+///
+/// Scans the first 1024 bytes, allowing for a UTF-8 BOM and leading whitespace.
+pub(crate) fn validate_pdf_bytes(buffer: &[u8]) -> Result<(), PdfError> {
+    if buffer.is_empty() {
+        return Err(PdfError::NotAPdf(detect_file_type_hint(buffer)));
+    }
+
+    let header = &buffer[..buffer.len().min(1024)];
+    let trimmed = strip_bom_and_whitespace(header);
+
+    if trimmed.starts_with(b"%PDF-") {
+        Ok(())
+    } else {
+        Err(PdfError::NotAPdf(detect_file_type_hint(buffer)))
+    }
+}
+
+/// Validate that a file on disk looks like a PDF.
+///
+/// Reads only the first 1024 bytes and delegates to [`validate_pdf_bytes`].
+pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 1024];
+    let n = file.read(&mut buf)?;
+    validate_pdf_bytes(&buf[..n])
 }
