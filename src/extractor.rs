@@ -5,7 +5,7 @@
 use crate::glyph_names::glyph_to_char;
 use crate::tounicode::FontCMaps;
 use crate::PdfError;
-use lopdf::{Document, Object, ObjectId};
+use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -961,6 +961,16 @@ fn extract_page_text_items(
         }
     }
 
+    // Cache font encodings from lopdf (once per font, not per text operand).
+    // This avoids re-parsing ToUnicode CMap streams for every Tj/TJ operator.
+    let mut encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+    for (font_name, font_dict) in &fonts {
+        let name = String::from_utf8_lossy(font_name).to_string();
+        if let Ok(enc) = font_dict.get_font_encoding(doc) {
+            encoding_cache.insert(name, enc);
+        }
+    }
+
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
@@ -1120,13 +1130,12 @@ fn extract_page_text_items(
                     }
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
-                        doc,
-                        &fonts,
                         &current_font,
                         font_cmaps,
                         &font_base_names,
                         &font_tounicode_refs,
                         &font_encodings,
+                        &encoding_cache,
                     ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
@@ -1224,13 +1233,12 @@ fn extract_page_text_items(
                             if !fill_is_white {
                                 if let Some(text) = extract_text_from_operand(
                                     element,
-                                    doc,
-                                    &fonts,
                                     &current_font,
                                     font_cmaps,
                                     &font_base_names,
                                     &font_tounicode_refs,
                                     &font_encodings,
+                                    &encoding_cache,
                                 ) {
                                     combined_text.push_str(&text);
                                 }
@@ -1287,13 +1295,12 @@ fn extract_page_text_items(
                 if !fill_is_white && !op.operands.is_empty() {
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
-                        doc,
-                        &fonts,
                         &current_font,
                         font_cmaps,
                         &font_base_names,
                         &font_tounicode_refs,
                         &font_encodings,
+                        &encoding_cache,
                     ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
@@ -1498,6 +1505,15 @@ fn extract_form_xobject_text(
         }
     }
 
+    // Cache font encodings for form fonts
+    let mut encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+    for (font_name, font_dict) in &form_fonts {
+        let name = String::from_utf8_lossy(font_name).to_string();
+        if let Ok(enc) = font_dict.get_font_encoding(doc) {
+            encoding_cache.insert(name, enc);
+        }
+    }
+
     // Process the content stream
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
@@ -1578,13 +1594,12 @@ fn extract_form_xobject_text(
                     }
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
-                        doc,
-                        &form_fonts,
                         &current_font,
                         font_cmaps,
                         &font_base_names,
                         &font_tounicode_refs,
                         &font_encodings,
+                        &encoding_cache,
                     ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
@@ -1682,13 +1697,12 @@ fn extract_form_xobject_text(
                             if !fill_is_white {
                                 if let Some(text) = extract_text_from_operand(
                                     element,
-                                    doc,
-                                    &form_fonts,
                                     &current_font,
                                     font_cmaps,
                                     &font_base_names,
                                     &font_tounicode_refs,
                                     &font_encodings,
+                                    &encoding_cache,
                                 ) {
                                     combined_text.push_str(&text);
                                 }
@@ -1965,13 +1979,12 @@ pub fn is_italic_font(font_name: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn extract_text_from_operand(
     obj: &Object,
-    doc: &Document,
-    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
     current_font: &str,
     font_cmaps: &FontCMaps,
     font_base_names: &std::collections::HashMap<String, String>,
     font_tounicode_refs: &std::collections::HashMap<String, u32>,
     font_encodings: &PageFontEncodings,
+    encoding_cache: &HashMap<String, Encoding<'_>>,
 ) -> Option<String> {
     if let Object::String(bytes, _) = obj {
         // First, try to look up CMap by ToUnicode object reference (most reliable)
@@ -2043,12 +2056,10 @@ fn extract_text_from_operand(
             }
         }
 
-        // Try to decode using font encoding from lopdf
-        if let Some(font_dict) = fonts.get(current_font.as_bytes()) {
-            if let Ok(encoding) = font_dict.get_font_encoding(doc) {
-                if let Ok(text) = Document::decode_text(&encoding, bytes) {
-                    return Some(text);
-                }
+        // Try to decode using cached font encoding from lopdf
+        if let Some(encoding) = encoding_cache.get(current_font) {
+            if let Ok(text) = Document::decode_text(encoding, bytes) {
+                return Some(text);
             }
         }
 

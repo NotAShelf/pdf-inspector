@@ -108,6 +108,9 @@ impl ToUnicodeCMap {
             2 // Default to 2-byte
         };
 
+        // Sort ranges by start CID for binary search in lookup()
+        cmap.ranges.sort_unstable_by_key(|&(start, _, _)| start);
+
         Some(cmap)
     }
 
@@ -308,11 +311,28 @@ impl ToUnicodeCMap {
             return Some(s.clone());
         }
 
-        // Then check ranges
-        for &(start, end, base) in &self.ranges {
+        // Binary search through sorted ranges
+        let idx = self
+            .ranges
+            .binary_search_by(|&(start, _, _)| start.cmp(&cid))
+            .unwrap_or_else(|i| i);
+
+        // Check the range at idx (where start == cid)
+        if idx < self.ranges.len() {
+            let (start, end, base) = self.ranges[idx];
             if cid >= start && cid <= end {
-                let offset = (cid - start) as u32;
-                let unicode = base + offset;
+                let unicode = base + (cid - start) as u32;
+                if let Some(c) = char::from_u32(unicode) {
+                    return Some(c.to_string());
+                }
+            }
+        }
+
+        // Check the range before idx (cid may fall within a range that starts before it)
+        if idx > 0 {
+            let (start, end, base) = self.ranges[idx - 1];
+            if cid >= start && cid <= end {
+                let unicode = base + (cid - start) as u32;
                 if let Some(c) = char::from_u32(unicode) {
                     return Some(c.to_string());
                 }
@@ -499,10 +519,11 @@ pub fn extract_tounicode_cmaps(pdf_bytes: &[u8]) -> HashMap<u32, ToUnicodeCMap> 
         }
 
         if let Ok(obj_num) = num_str.parse::<u32>() {
-            // Try to extract the stream for this object
-            if let Some(stream_data) = extract_stream_from_raw_pdf(pdf_bytes, obj_num) {
-                if let Some(cmap) = ToUnicodeCMap::parse(&stream_data) {
-                    cmaps.insert(obj_num, cmap);
+            if let std::collections::hash_map::Entry::Vacant(e) = cmaps.entry(obj_num) {
+                if let Some(stream_data) = extract_stream_from_raw_pdf(pdf_bytes, obj_num) {
+                    if let Some(cmap) = ToUnicodeCMap::parse(&stream_data) {
+                        e.insert(cmap);
+                    }
                 }
             }
         }
