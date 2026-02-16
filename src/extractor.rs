@@ -973,7 +973,8 @@ fn extract_page_text_items(
 
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
-    let mut ctm_stack: Vec<[f32; 6]> = Vec::new();
+    let mut fill_is_white = false; // Fill color is white (invisible text)
+    let mut gstate_stack: Vec<([f32; 6], bool)> = Vec::new();
 
     // Text state tracking
     let mut current_font = String::new();
@@ -986,12 +987,13 @@ fn extract_page_text_items(
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state
-                ctm_stack.push(ctm);
+                gstate_stack.push((ctm, fill_is_white));
             }
             "Q" => {
                 // Restore graphics state
-                if let Some(saved) = ctm_stack.pop() {
-                    ctm = saved;
+                if let Some((saved_ctm, saved_fill)) = gstate_stack.pop() {
+                    ctm = saved_ctm;
+                    fill_is_white = saved_fill;
                 }
             }
             "cm" => {
@@ -1006,6 +1008,31 @@ fn extract_page_text_items(
                         get_number(&op.operands[5]).unwrap_or(0.0),
                     ];
                     ctm = multiply_matrices(&new_matrix, &ctm);
+                }
+            }
+            "g" => {
+                // Set grayscale fill color (1.0 = white)
+                if let Some(gray) = op.operands.first().and_then(get_number) {
+                    fill_is_white = gray > 0.95;
+                }
+            }
+            "rg" => {
+                // Set RGB fill color
+                if op.operands.len() >= 3 {
+                    let r = get_number(&op.operands[0]).unwrap_or(0.0);
+                    let g = get_number(&op.operands[1]).unwrap_or(0.0);
+                    let b = get_number(&op.operands[2]).unwrap_or(0.0);
+                    fill_is_white = r > 0.95 && g > 0.95 && b > 0.95;
+                }
+            }
+            "k" => {
+                // Set CMYK fill color (0,0,0,0 = white)
+                if op.operands.len() >= 4 {
+                    let c = get_number(&op.operands[0]).unwrap_or(1.0);
+                    let m = get_number(&op.operands[1]).unwrap_or(1.0);
+                    let y = get_number(&op.operands[2]).unwrap_or(1.0);
+                    let k = get_number(&op.operands[3]).unwrap_or(1.0);
+                    fill_is_white = c < 0.05 && m < 0.05 && y < 0.05 && k < 0.05;
                 }
             }
             "BT" => {
@@ -1059,6 +1086,21 @@ fn extract_page_text_items(
             "Tj" => {
                 // Show text string
                 if in_text_block && !op.operands.is_empty() {
+                    // Skip invisible (white) text but still advance text matrix
+                    if fill_is_white {
+                        if let Some(font_info) = font_widths.get(&current_font) {
+                            if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
+                                let w_ts = compute_string_width_ts(
+                                    raw_bytes,
+                                    font_info,
+                                    current_font_size,
+                                );
+                                text_matrix[4] += w_ts * text_matrix[0];
+                                text_matrix[5] += w_ts * text_matrix[1];
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
                         doc,
@@ -1072,10 +1114,8 @@ fn extract_page_text_items(
                         if !text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
-                            // Transform position through CTM
                             let combined = multiply_matrices(&text_matrix, &ctm);
                             let (x, y) = (combined[4], combined[5]);
-                            // Compute width from font widths if available
                             let width = if let Some(font_info) = font_widths.get(&current_font) {
                                 if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
                                     let w_ts = compute_string_width_ts(
@@ -1083,10 +1123,8 @@ fn extract_page_text_items(
                                         font_info,
                                         current_font_size,
                                     );
-                                    // Advance text matrix by string width
                                     text_matrix[4] += w_ts * text_matrix[0];
                                     text_matrix[5] += w_ts * text_matrix[1];
-                                    // Transform width through text matrix and CTM
                                     (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2]))
                                         .abs()
                                 } else {
@@ -1095,7 +1133,6 @@ fn extract_page_text_items(
                             } else {
                                 0.0
                             };
-                            // Detect bold/italic from font name
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -1125,13 +1162,11 @@ fn extract_page_text_items(
 
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
-                            // Use 40% of the font's space width (in thousandths of text space)
                             let space_em = font_info.space_width as f32 * font_info.units_scale;
                             let threshold = space_em * 1000.0 * 0.4;
-                            // Clamp to reasonable range: at least 80, at most 200
                             threshold.clamp(80.0, 200.0)
                         } else {
-                            120.0 // fallback threshold
+                            120.0
                         };
 
                         let mut combined_text = String::new();
@@ -1140,9 +1175,9 @@ fn extract_page_text_items(
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
-                                    // Track displacement for total width
                                     total_width_ts += -n_val / 1000.0 * current_font_size;
-                                    if n_val < -space_threshold
+                                    if !fill_is_white
+                                        && n_val < -space_threshold
                                         && !combined_text.is_empty()
                                         && !combined_text.ends_with(' ')
                                     {
@@ -1152,7 +1187,8 @@ fn extract_page_text_items(
                                 }
                                 Object::Real(n) => {
                                     total_width_ts += -(*n) / 1000.0 * current_font_size;
-                                    if *n < -space_threshold
+                                    if !fill_is_white
+                                        && *n < -space_threshold
                                         && !combined_text.is_empty()
                                         && !combined_text.ends_with(' ')
                                     {
@@ -1162,32 +1198,32 @@ fn extract_page_text_items(
                                 }
                                 _ => {}
                             }
-                            // Compute string width for total
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
                                     total_width_ts +=
                                         compute_string_width_ts(raw_bytes, fi, current_font_size);
                                 }
                             }
-                            if let Some(text) = extract_text_from_operand(
-                                element,
-                                doc,
-                                &fonts,
-                                &current_font,
-                                font_cmaps,
-                                &font_base_names,
-                                &font_tounicode_refs,
-                                &font_encodings,
-                            ) {
-                                combined_text.push_str(&text);
+                            if !fill_is_white {
+                                if let Some(text) = extract_text_from_operand(
+                                    element,
+                                    doc,
+                                    &fonts,
+                                    &current_font,
+                                    font_cmaps,
+                                    &font_base_names,
+                                    &font_tounicode_refs,
+                                    &font_encodings,
+                                ) {
+                                    combined_text.push_str(&text);
+                                }
                             }
                         }
-                        if !combined_text.trim().is_empty() {
+                        if !fill_is_white && !combined_text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
                             let combined = multiply_matrices(&text_matrix, &ctm);
                             let (x, y) = (combined[4], combined[5]);
-                            // Compute accurate width if font widths available
                             let width = if font_info.is_some() {
                                 (total_width_ts
                                     * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2]))
@@ -1212,11 +1248,11 @@ fn extract_page_text_items(
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
                             });
-                            // Advance text matrix by total width
-                            if font_info.is_some() {
-                                text_matrix[4] += total_width_ts * text_matrix[0];
-                                text_matrix[5] += total_width_ts * text_matrix[1];
-                            }
+                        }
+                        // Always advance text matrix by total width
+                        if font_info.is_some() {
+                            text_matrix[4] += total_width_ts * text_matrix[0];
+                            text_matrix[5] += total_width_ts * text_matrix[1];
                         }
                     }
                 }
@@ -1225,7 +1261,7 @@ fn extract_page_text_items(
                 // Move to next line and show text
                 line_matrix[5] -= current_font_size * 1.2;
                 text_matrix = line_matrix;
-                if !op.operands.is_empty() {
+                if !fill_is_white && !op.operands.is_empty() {
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
                         doc,
@@ -1239,10 +1275,8 @@ fn extract_page_text_items(
                         if !text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
-                            // Transform position through CTM
                             let combined = multiply_matrices(&text_matrix, &ctm);
                             let (x, y) = (combined[4], combined[5]);
-                            // Detect bold/italic from font name
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -1446,6 +1480,7 @@ fn extract_form_xobject_text(
     let mut current_font_size: f32 = 12.0;
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
+    let mut fill_is_white = false;
 
     for op in &content.operations {
         match op.operator.as_str() {
@@ -1480,8 +1515,44 @@ fn extract_form_xobject_text(
                     }
                 }
             }
+            "g" => {
+                if let Some(gray) = op.operands.first().and_then(get_number) {
+                    fill_is_white = gray > 0.95;
+                }
+            }
+            "rg" => {
+                if op.operands.len() >= 3 {
+                    let r = get_number(&op.operands[0]).unwrap_or(0.0);
+                    let g = get_number(&op.operands[1]).unwrap_or(0.0);
+                    let b = get_number(&op.operands[2]).unwrap_or(0.0);
+                    fill_is_white = r > 0.95 && g > 0.95 && b > 0.95;
+                }
+            }
+            "k" => {
+                if op.operands.len() >= 4 {
+                    let c = get_number(&op.operands[0]).unwrap_or(1.0);
+                    let m = get_number(&op.operands[1]).unwrap_or(1.0);
+                    let y = get_number(&op.operands[2]).unwrap_or(1.0);
+                    let k = get_number(&op.operands[3]).unwrap_or(1.0);
+                    fill_is_white = c < 0.05 && m < 0.05 && y < 0.05 && k < 0.05;
+                }
+            }
             "Tj" => {
                 if in_text_block && !op.operands.is_empty() {
+                    if fill_is_white {
+                        if let Some(font_info) = font_widths.get(&current_font) {
+                            if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
+                                let w_ts = compute_string_width_ts(
+                                    raw_bytes,
+                                    font_info,
+                                    current_font_size,
+                                );
+                                text_matrix[4] += w_ts * text_matrix[0];
+                                text_matrix[5] += w_ts * text_matrix[1];
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
                         doc,
@@ -1497,7 +1568,6 @@ fn extract_form_xobject_text(
                                 effective_font_size(current_font_size, &text_matrix);
                             let combined = multiply_matrices(&text_matrix, parent_ctm);
                             let (x, y) = (combined[4], combined[5]);
-                            // Compute width from font widths if available
                             let width = if let Some(font_info) = font_widths.get(&current_font) {
                                 if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
                                     let w_ts = compute_string_width_ts(
@@ -1543,7 +1613,6 @@ fn extract_form_xobject_text(
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
 
-                        // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(fi) = font_info {
                             let space_em = fi.space_width as f32 * fi.units_scale;
                             let threshold = space_em * 1000.0 * 0.4;
@@ -1559,7 +1628,8 @@ fn extract_form_xobject_text(
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
                                     total_width_ts += -n_val / 1000.0 * current_font_size;
-                                    if n_val < -space_threshold
+                                    if !fill_is_white
+                                        && n_val < -space_threshold
                                         && !combined_text.is_empty()
                                         && !combined_text.ends_with(' ')
                                     {
@@ -1569,7 +1639,8 @@ fn extract_form_xobject_text(
                                 }
                                 Object::Real(n) => {
                                     total_width_ts += -(*n) / 1000.0 * current_font_size;
-                                    if *n < -space_threshold
+                                    if !fill_is_white
+                                        && *n < -space_threshold
                                         && !combined_text.is_empty()
                                         && !combined_text.ends_with(' ')
                                     {
@@ -1585,20 +1656,22 @@ fn extract_form_xobject_text(
                                         compute_string_width_ts(raw_bytes, fi, current_font_size);
                                 }
                             }
-                            if let Some(text) = extract_text_from_operand(
-                                element,
-                                doc,
-                                &form_fonts,
-                                &current_font,
-                                font_cmaps,
-                                &font_base_names,
-                                &font_tounicode_refs,
-                                &font_encodings,
-                            ) {
-                                combined_text.push_str(&text);
+                            if !fill_is_white {
+                                if let Some(text) = extract_text_from_operand(
+                                    element,
+                                    doc,
+                                    &form_fonts,
+                                    &current_font,
+                                    font_cmaps,
+                                    &font_base_names,
+                                    &font_tounicode_refs,
+                                    &font_encodings,
+                                ) {
+                                    combined_text.push_str(&text);
+                                }
                             }
                         }
-                        if !combined_text.trim().is_empty() {
+                        if !fill_is_white && !combined_text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
                             let combined_mat = multiply_matrices(&text_matrix, parent_ctm);
@@ -1628,10 +1701,11 @@ fn extract_form_xobject_text(
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
                             });
-                            if font_info.is_some() {
-                                text_matrix[4] += total_width_ts * text_matrix[0];
-                                text_matrix[5] += total_width_ts * text_matrix[1];
-                            }
+                        }
+                        // Always advance text matrix
+                        if font_info.is_some() {
+                            text_matrix[4] += total_width_ts * text_matrix[0];
+                            text_matrix[5] += total_width_ts * text_matrix[1];
                         }
                     }
                 }
