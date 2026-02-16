@@ -2109,9 +2109,9 @@ fn effective_width(item: &TextItem) -> f32 {
 
 /// Represents a column region on a page
 #[derive(Debug, Clone)]
-struct ColumnRegion {
-    x_min: f32,
-    x_max: f32,
+pub(crate) struct ColumnRegion {
+    pub(crate) x_min: f32,
+    pub(crate) x_max: f32,
 }
 
 /// Detect column boundaries on a page using a horizontal projection profile.
@@ -2119,7 +2119,7 @@ struct ColumnRegion {
 /// Builds an occupancy histogram across the page width and finds empty valleys
 /// (gutters) where no text exists. Validates valleys with vertical consistency
 /// checks to avoid false positives.
-fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
+pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
     const BIN_WIDTH: f32 = 2.0;
     const MIN_GUTTER_WIDTH: f32 = 8.0;
     const MIN_VERTICAL_SPAN_RATIO: f32 = 0.30;
