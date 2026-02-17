@@ -36,6 +36,8 @@ pub struct MarkdownOptions {
     pub include_images: bool,
     /// Include extracted hyperlinks
     pub include_links: bool,
+    /// Insert page break markers (<!-- Page N -->) between pages
+    pub include_page_numbers: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -52,6 +54,7 @@ impl Default for MarkdownOptions {
             detect_italic: true,
             include_images: true,
             include_links: true,
+            include_page_numbers: false,
         }
     }
 }
@@ -518,6 +521,10 @@ fn to_markdown_from_lines_with_tables_and_images(
 
             current_page = line.page;
             prev_y = f32::MAX;
+
+            if options.include_page_numbers {
+                output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
+            }
         }
 
         // Check if we should insert a table before this line
@@ -757,6 +764,10 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             prev_y = f32::MAX;
             in_list = false;
             last_list_x = None;
+
+            if options.include_page_numbers {
+                output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
+            }
         }
 
         // Paragraph break (large Y gap relative to document's typical line spacing)

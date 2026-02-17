@@ -535,7 +535,7 @@ pub fn extract_tounicode_cmaps(pdf_bytes: &[u8]) -> HashMap<u32, ToUnicodeCMap> 
 }
 
 /// Collection of ToUnicode CMaps indexed by font name
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FontCMaps {
     /// Map of font name (e.g., "FNotoSans0") to ToUnicodeCMap
     pub by_name: HashMap<String, ToUnicodeCMap>,
@@ -605,26 +605,9 @@ impl FontCMaps {
         }
     }
 
-    /// Get a CMap for a font name
+    /// Get a CMap for a font name (exact match only)
     pub fn get(&self, font_name: &str) -> Option<&ToUnicodeCMap> {
-        // Try exact match first
-        if let Some(cmap) = self.by_name.get(font_name) {
-            return Some(cmap);
-        }
-
-        // Try without leading 'F' if present (resource names sometimes differ)
-        // but only if the stripped name is long enough to avoid false matches
-        // (e.g., "F1" → "1" would match too many things)
-        let stripped = font_name.strip_prefix('F').unwrap_or(font_name);
-        if stripped.len() >= 4 {
-            for (name, cmap) in &self.by_name {
-                if name.contains(stripped) || stripped.contains(name.as_str()) {
-                    return Some(cmap);
-                }
-            }
-        }
-
-        None
+        self.by_name.get(font_name)
     }
 
     /// Get a CMap by ToUnicode object number

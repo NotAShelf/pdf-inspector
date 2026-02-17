@@ -265,6 +265,7 @@ fn test_markdown_options_custom() {
         detect_italic: false,
         include_images: false,
         include_links: false,
+        include_page_numbers: false,
     };
     assert!(!opts.detect_headers);
     assert!(opts.detect_lists);

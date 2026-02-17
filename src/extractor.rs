@@ -6,7 +6,7 @@ use crate::glyph_names::glyph_to_char;
 use crate::tounicode::FontCMaps;
 use crate::PdfError;
 use lopdf::{Document, Encoding, Object, ObjectId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Font encoding map: maps byte codes to Unicode characters
@@ -747,10 +747,10 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
         }
 
         // Single-character fragment joined to a multi-character item: use a
-        // more generous threshold to rejoin split words like "b" + "illion"
-        // or "C" + "ultural".
+        // moderately generous threshold to rejoin split words like "b" + "illion"
+        // or "C" + "ultural". Gap near 0 = same word; gap ~0.2+ = different words.
         if (prev_chars == 1) != (curr_chars == 1) {
-            return gap < font_size * 0.25;
+            return gap < font_size * 0.20;
         }
 
         // Both single-char: per-glyph positioning. For numeric characters
@@ -874,34 +874,70 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
 
 /// Extract text with position information from PDF file
 pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
+    extract_text_with_positions_pages(path, None)
+}
+
+/// Extract text with positions from a file, limited to specific pages.
+///
+/// `page_filter` is an optional set of 1-indexed page numbers to process.
+/// When `None`, all pages are processed.
+pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
+    path: P,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<Vec<TextItem>, PdfError> {
     // Read the raw PDF bytes for ToUnicode extraction
     let pdf_bytes = std::fs::read(path.as_ref())?;
     crate::validate_pdf_bytes(&pdf_bytes)?;
     let font_cmaps = FontCMaps::from_pdf_bytes(&pdf_bytes);
 
     let doc = Document::load_mem(&pdf_bytes)?;
-    extract_positioned_text_from_doc(&doc, &font_cmaps)
+    extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)
 }
 
 /// Extract text with positions from memory buffer
 pub fn extract_text_with_positions_mem(buffer: &[u8]) -> Result<Vec<TextItem>, PdfError> {
+    extract_text_with_positions_mem_pages(buffer, None)
+}
+
+/// Extract text with positions from memory buffer, limited to specific pages.
+pub fn extract_text_with_positions_mem_pages(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<Vec<TextItem>, PdfError> {
     crate::validate_pdf_bytes(buffer)?;
     // Extract ToUnicode CMaps from raw PDF bytes
     let font_cmaps = FontCMaps::from_pdf_bytes(buffer);
 
     let doc = Document::load_mem(buffer)?;
-    extract_positioned_text_from_doc(&doc, &font_cmaps)
+    extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)
 }
 
 /// Extract positioned text from loaded document
 fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
+    // If raw byte scanning found no CMaps, populate from the document model.
+    // This handles PDFs with compressed object streams where raw scanning fails.
+    let mut font_cmaps_owned;
+    let font_cmaps = if font_cmaps.by_obj_num.is_empty() {
+        font_cmaps_owned = font_cmaps.clone();
+        populate_cmaps_from_doc(doc, &mut font_cmaps_owned);
+        &font_cmaps_owned
+    } else {
+        font_cmaps
+    };
+
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
 
     for (page_num, &page_id) in pages.iter() {
+        if let Some(filter) = page_filter {
+            if !filter.contains(page_num) {
+                continue;
+            }
+        }
         let items = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
         all_items.extend(items);
 
@@ -911,6 +947,54 @@ fn extract_positioned_text_from_doc(
     }
 
     Ok(all_items)
+}
+
+/// Populate FontCMaps from the lopdf document model for ToUnicode streams
+/// that weren't found by raw byte scanning (e.g. in compressed object streams).
+fn populate_cmaps_from_doc(doc: &Document, font_cmaps: &mut FontCMaps) {
+    use crate::tounicode::ToUnicodeCMap;
+
+    for (_page_num, &page_id) in doc.get_pages().iter() {
+        let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
+        for (font_name, font_dict) in &fonts {
+            if let Ok(tounicode_ref) = font_dict.get(b"ToUnicode") {
+                if let Ok(obj_ref) = tounicode_ref.as_reference() {
+                    let obj_num = obj_ref.0;
+                    if font_cmaps.by_obj_num.contains_key(&obj_num) {
+                        continue;
+                    }
+                    // Try to get the stream content via lopdf
+                    if let Ok(stream) = doc.get_object(obj_ref) {
+                        if let Ok(stream) = stream.as_stream() {
+                            if let Ok(data) = stream.decompressed_content() {
+                                if let Some(cmap) = ToUnicodeCMap::parse(&data) {
+                                    let resource_name =
+                                        String::from_utf8_lossy(font_name).to_string();
+                                    let base_name = font_dict
+                                        .get(b"BaseFont")
+                                        .ok()
+                                        .and_then(|o| o.as_name().ok())
+                                        .map(|n| String::from_utf8_lossy(n).to_string());
+
+                                    // Store by object number
+                                    font_cmaps.by_obj_num.insert(obj_num, cmap.clone());
+                                    // Store by resource name
+                                    font_cmaps
+                                        .by_name
+                                        .insert(resource_name.clone(), cmap.clone());
+                                    if let Some(base) = base_name {
+                                        let unique_key = format!("{}_{}", base, obj_num);
+                                        font_cmaps.by_name.insert(unique_key, cmap.clone());
+                                        font_cmaps.by_name.insert(base, cmap);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Multiply two 2D transformation matrices
@@ -1146,28 +1230,28 @@ fn extract_page_text_items(
                         &font_encodings,
                         &encoding_cache,
                     ) {
-                        if !text.trim().is_empty() {
-                            let rendered_size =
-                                effective_font_size(current_font_size, &text_matrix);
-                            let combined = multiply_matrices(&text_matrix, &ctm);
-                            let (x, y) = (combined[4], combined[5]);
-                            let width = if let Some(font_info) = font_widths.get(&current_font) {
-                                if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
-                                    let w_ts = compute_string_width_ts(
-                                        raw_bytes,
-                                        font_info,
-                                        current_font_size,
-                                    );
-                                    text_matrix[4] += w_ts * text_matrix[0];
-                                    text_matrix[5] += w_ts * text_matrix[1];
-                                    (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2]))
-                                        .abs()
-                                } else {
-                                    0.0
-                                }
+                        let rendered_size = effective_font_size(current_font_size, &text_matrix);
+                        let combined = multiply_matrices(&text_matrix, &ctm);
+                        let (x, y) = (combined[4], combined[5]);
+                        let width = if let Some(font_info) = font_widths.get(&current_font) {
+                            if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
+                                let w_ts = compute_string_width_ts(
+                                    raw_bytes,
+                                    font_info,
+                                    current_font_size,
+                                );
+                                text_matrix[4] += w_ts * text_matrix[0];
+                                text_matrix[5] += w_ts * text_matrix[1];
+                                (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])).abs()
                             } else {
                                 0.0
-                            };
+                            }
+                        } else {
+                            0.0
+                        };
+                        // Only create text item for non-whitespace; whitespace
+                        // still advances the text matrix above so gap detection works
+                        if !text.trim().is_empty() {
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -1659,30 +1743,31 @@ fn extract_form_xobject_text(
                         &font_encodings,
                         &encoding_cache,
                     ) {
-                        if !text.trim().is_empty() {
-                            let rendered_size =
-                                effective_font_size(current_font_size, &text_matrix);
-                            let combined = multiply_matrices(&text_matrix, parent_ctm);
-                            let (x, y) = (combined[4], combined[5]);
-                            let width = if let Some(font_info) = font_widths.get(&current_font) {
-                                if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
-                                    let w_ts = compute_string_width_ts(
-                                        raw_bytes,
-                                        font_info,
-                                        current_font_size,
-                                    );
-                                    text_matrix[4] += w_ts * text_matrix[0];
-                                    text_matrix[5] += w_ts * text_matrix[1];
-                                    (w_ts
-                                        * (text_matrix[0] * parent_ctm[0]
-                                            + text_matrix[1] * parent_ctm[2]))
-                                        .abs()
-                                } else {
-                                    0.0
-                                }
+                        let rendered_size = effective_font_size(current_font_size, &text_matrix);
+                        let combined = multiply_matrices(&text_matrix, parent_ctm);
+                        let (x, y) = (combined[4], combined[5]);
+                        let width = if let Some(font_info) = font_widths.get(&current_font) {
+                            if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
+                                let w_ts = compute_string_width_ts(
+                                    raw_bytes,
+                                    font_info,
+                                    current_font_size,
+                                );
+                                text_matrix[4] += w_ts * text_matrix[0];
+                                text_matrix[5] += w_ts * text_matrix[1];
+                                (w_ts
+                                    * (text_matrix[0] * parent_ctm[0]
+                                        + text_matrix[1] * parent_ctm[2]))
+                                    .abs()
                             } else {
                                 0.0
-                            };
+                            }
+                        } else {
+                            0.0
+                        };
+                        // Only create text item for non-whitespace; whitespace
+                        // still advances the text matrix above so gap detection works
+                        if !text.trim().is_empty() {
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())

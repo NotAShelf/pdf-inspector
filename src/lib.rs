@@ -16,7 +16,9 @@ pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
-pub use extractor::{extract_text, extract_text_with_positions, TextItem};
+pub use extractor::{
+    extract_text, extract_text_with_positions, extract_text_with_positions_pages, TextItem,
+};
 pub use markdown::{to_markdown, to_markdown_from_items, MarkdownOptions};
 
 use std::path::Path;
@@ -112,10 +114,24 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
     Ok(result)
 }
 
-/// Process a PDF file with custom detection configuration
+/// Process a PDF file with custom detection and markdown configuration
 pub fn process_pdf_with_config<P: AsRef<Path>>(
     path: P,
     config: DetectionConfig,
+    markdown_options: MarkdownOptions,
+) -> Result<PdfProcessResult, PdfError> {
+    process_pdf_with_config_pages(path, config, markdown_options, None)
+}
+
+/// Process a PDF file with custom configuration and optional page filter.
+///
+/// `page_filter` limits extraction to the given 1-indexed page numbers.
+/// When `None`, all pages are processed.
+pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
+    path: P,
+    config: DetectionConfig,
+    markdown_options: MarkdownOptions,
+    page_filter: Option<&std::collections::HashSet<u32>>,
 ) -> Result<PdfProcessResult, PdfError> {
     let start = std::time::Instant::now();
 
@@ -130,8 +146,8 @@ pub fn process_pdf_with_config<P: AsRef<Path>>(
 
     let result = match pdf_type {
         PdfType::TextBased => {
-            let items = extract_text_with_positions(&path)?;
-            let markdown = to_markdown_from_items(items, MarkdownOptions::default());
+            let items = extract_text_with_positions_pages(&path, page_filter)?;
+            let markdown = to_markdown_from_items(items, markdown_options);
 
             PdfProcessResult {
                 pdf_type,
@@ -155,8 +171,8 @@ pub fn process_pdf_with_config<P: AsRef<Path>>(
             confidence,
         },
         PdfType::Mixed => {
-            let items = extract_text_with_positions(&path).ok();
-            let markdown = items.map(|i| to_markdown_from_items(i, MarkdownOptions::default()));
+            let items = extract_text_with_positions_pages(&path, page_filter).ok();
+            let markdown = items.map(|i| to_markdown_from_items(i, markdown_options.clone()));
 
             PdfProcessResult {
                 pdf_type,
@@ -235,10 +251,11 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
     Ok(result)
 }
 
-/// Process PDF from memory buffer with custom detection configuration
+/// Process PDF from memory buffer with custom detection and markdown configuration
 pub fn process_pdf_mem_with_config(
     buffer: &[u8],
     config: DetectionConfig,
+    markdown_options: MarkdownOptions,
 ) -> Result<PdfProcessResult, PdfError> {
     let start = std::time::Instant::now();
 
@@ -254,7 +271,7 @@ pub fn process_pdf_mem_with_config(
     let result = match pdf_type {
         PdfType::TextBased => {
             let items = extractor::extract_text_with_positions_mem(buffer)?;
-            let markdown = to_markdown_from_items(items, MarkdownOptions::default());
+            let markdown = to_markdown_from_items(items, markdown_options);
 
             PdfProcessResult {
                 pdf_type,
@@ -279,7 +296,7 @@ pub fn process_pdf_mem_with_config(
         },
         PdfType::Mixed => {
             let items = extractor::extract_text_with_positions_mem(buffer).ok();
-            let markdown = items.map(|i| to_markdown_from_items(i, MarkdownOptions::default()));
+            let markdown = items.map(|i| to_markdown_from_items(i, markdown_options.clone()));
 
             PdfProcessResult {
                 pdf_type,
