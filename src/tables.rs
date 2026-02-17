@@ -158,7 +158,7 @@ fn expand_consolidated_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<usize>) 
 }
 
 /// Detect tables in a set of text items from a single page
-pub fn detect_tables(items: &[TextItem], base_font_size: f32) -> Vec<Table> {
+pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bool) -> Vec<Table> {
     if items.len() < 6 {
         return vec![];
     }
@@ -192,9 +192,11 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32) -> Vec<Table> {
                 continue;
             }
 
-            if let Some(table) =
+            if let Some(mut table) =
                 detect_table_in_region(&region_items, TableDetectionMode::SmallFont)
             {
+                // Try to recover body-font header row above the small-font table
+                recover_header_row(&mut table, items, table_font_threshold);
                 for &idx in &table.item_indices {
                     claimed_indices.insert(idx);
                 }
@@ -204,37 +206,43 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32) -> Vec<Table> {
     }
 
     // === Pass 2: Body-font tables (stricter criteria) ===
-    let body_font_low = base_font_size * 0.85;
-    let body_font_high = base_font_size * 1.05;
+    // Skip on multi-column pages where body-font detection causes false positives
+    if !skip_body_font {
+        let body_font_low = base_font_size * 0.85;
+        let body_font_high = base_font_size * 1.05;
 
-    let body_candidates: Vec<(usize, &TextItem)> = items
-        .iter()
-        .enumerate()
-        .filter(|(idx, item)| {
-            !claimed_indices.contains(idx)
-                && item.font_size >= body_font_low
-                && item.font_size <= body_font_high
-                && item.font_size >= 6.0
-        })
-        .collect();
+        let body_candidates: Vec<(usize, &TextItem)> = items
+            .iter()
+            .enumerate()
+            .filter(|(idx, item)| {
+                !claimed_indices.contains(idx)
+                    && item.font_size >= body_font_low
+                    && item.font_size <= body_font_high
+                    && item.font_size >= 6.0
+            })
+            .collect();
 
-    if body_candidates.len() >= 9 {
-        let regions = find_table_regions_strict(&body_candidates);
+        if body_candidates.len() >= 9 {
+            let regions = find_table_regions_strict(&body_candidates);
 
-        for (y_min, y_max) in regions {
-            let region_items: Vec<(usize, &TextItem)> = body_candidates
-                .iter()
-                .filter(|(_, item)| item.y >= y_min && item.y <= y_max)
-                .cloned()
-                .collect();
+            for (y_min, y_max, x_min, x_max) in regions {
+                let region_items: Vec<(usize, &TextItem)> = body_candidates
+                    .iter()
+                    .filter(|(_, item)| {
+                        item.y >= y_min && item.y <= y_max && item.x >= x_min && item.x <= x_max
+                    })
+                    .cloned()
+                    .collect();
 
-            if region_items.len() < 9 {
-                continue;
-            }
+                if region_items.len() < 9 {
+                    continue;
+                }
 
-            if let Some(table) = detect_table_in_region(&region_items, TableDetectionMode::BodyFont)
-            {
-                tables.push(table);
+                if let Some(table) =
+                    detect_table_in_region(&region_items, TableDetectionMode::BodyFont)
+                {
+                    tables.push(table);
+                }
             }
         }
     }
@@ -294,7 +302,7 @@ fn find_table_regions(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
 /// Requires rows with 3+ distinct X-position clusters to qualify, and verifies
 /// that column positions are consistent across rows (tables have fixed columns,
 /// paragraph text has varying word positions).
-fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
+fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32, f32)> {
     if items.is_empty() {
         return vec![];
     }
@@ -405,7 +413,18 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
         if avg_score >= 0.5 {
             let y_min = region_rows.first().unwrap().0;
             let y_max = region_rows.last().unwrap().0;
-            regions.push((y_min - 5.0, y_max + 5.0));
+            // Compute X bounds from qualifying row cluster positions
+            let x_min = region_rows
+                .iter()
+                .flat_map(|(_, clusters)| clusters.iter())
+                .cloned()
+                .fold(f32::INFINITY, f32::min);
+            let x_max = region_rows
+                .iter()
+                .flat_map(|(_, clusters)| clusters.iter())
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            regions.push((y_min - 5.0, y_max + 5.0, x_min - 15.0, x_max + 50.0));
         }
     }
 
@@ -1025,6 +1044,101 @@ fn join_cell_items(items: &[&TextItem]) -> String {
     result
 }
 
+/// Recover a header row for small-font tables by looking at body-font items
+/// just above the table's first row.
+///
+/// PDF tables often have header rows at the body font size while data rows use
+/// a smaller font. Pass 1 (SmallFont) excludes the header because of the
+/// font-size filter. This function looks upward from the table's first row for
+/// body-font items that align with the table's columns, and prepends them.
+fn recover_header_row(table: &mut Table, all_items: &[TextItem], small_font_threshold: f32) {
+    if table.rows.is_empty() || table.columns.is_empty() {
+        return;
+    }
+
+    let first_row_y = table.rows[0]; // highest Y (rows are descending)
+
+    // Compute typical row spacing for gap threshold
+    let row_gap_limit = if table.rows.len() >= 2 {
+        let avg_spacing =
+            (table.rows[0] - table.rows[table.rows.len() - 1]) / (table.rows.len() - 1) as f32;
+        // Allow up to 2x average row spacing for the header gap
+        (avg_spacing * 2.0).clamp(10.0, 40.0)
+    } else {
+        30.0
+    };
+
+    // Find body-font items just above the first row
+    let header_candidates: Vec<(usize, &TextItem)> = all_items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.font_size > small_font_threshold
+                && item.y > first_row_y
+                && item.y <= first_row_y + row_gap_limit
+        })
+        .collect();
+
+    if header_candidates.is_empty() {
+        return;
+    }
+
+    // Group header candidates by Y (cluster within 5pt)
+    let mut header_y_groups: Vec<(f32, Vec<(usize, &TextItem)>)> = Vec::new();
+    let mut sorted_candidates = header_candidates;
+    sorted_candidates.sort_by(|a, b| {
+        b.1.y
+            .partial_cmp(&a.1.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for (idx, item) in &sorted_candidates {
+        let found = header_y_groups
+            .iter_mut()
+            .find(|(y, _)| (item.y - *y).abs() < 5.0);
+        if let Some((_, group)) = found {
+            group.push((*idx, item));
+        } else {
+            header_y_groups.push((item.y, vec![(*idx, item)]));
+        }
+    }
+
+    // Take the row closest to the table (lowest Y above first_row_y)
+    // header_y_groups is sorted by descending Y, so take the last one
+    let (header_y, header_items) = header_y_groups.last().unwrap();
+
+    // Map header items to table columns
+    let num_cols = table.columns.len();
+    let mut header_cells: Vec<String> = vec![String::new(); num_cols];
+    let mut mapped_count = 0;
+    let mut header_indices = Vec::new();
+
+    for (idx, item) in header_items {
+        if let Some(col) = find_column_index(&table.columns, item.x) {
+            let text = item.text.trim();
+            if !text.is_empty() {
+                if !header_cells[col].is_empty() {
+                    header_cells[col].push(' ');
+                }
+                header_cells[col].push_str(text);
+                mapped_count += 1;
+                header_indices.push(*idx);
+            }
+        }
+    }
+
+    // Require at least 2 columns populated to look like a real header row
+    let populated = header_cells.iter().filter(|c| !c.is_empty()).count();
+    if populated < 2 || mapped_count < 2 {
+        return;
+    }
+
+    // Prepend header row to the table
+    table.rows.insert(0, *header_y);
+    table.cells.insert(0, header_cells);
+    table.item_indices.extend(header_indices);
+}
+
 /// Format a table as markdown
 pub fn table_to_markdown(table: &Table) -> String {
     if table.cells.is_empty() || table.cells[0].is_empty() {
@@ -1344,7 +1458,7 @@ mod tests {
             make_item("9.5", 360.0, 440.0, 8.0),
         ];
 
-        let tables = detect_tables(&items, 10.0);
+        let tables = detect_tables(&items, 10.0, false);
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].columns.len(), 4);
         assert_eq!(tables[0].rows.len(), 4);
@@ -1395,7 +1509,7 @@ mod tests {
             make_item("65.00", 400.0, 440.0, 10.0),
         ];
 
-        let tables = detect_tables(&items, 10.0);
+        let tables = detect_tables(&items, 10.0, false);
         assert_eq!(
             tables.len(),
             1,
@@ -1471,7 +1585,7 @@ mod tests {
             ),
         ];
 
-        let tables = detect_tables(&items, 10.0);
+        let tables = detect_tables(&items, 10.0, false);
         assert_eq!(
             tables.len(),
             0,
@@ -1517,7 +1631,7 @@ mod tests {
             make_item("approved", 350.0, 455.0, 10.0),
         ];
 
-        let tables = detect_tables(&items, 10.0);
+        let tables = detect_tables(&items, 10.0, false);
         assert_eq!(
             tables.len(),
             0,
@@ -1559,7 +1673,7 @@ mod tests {
             ));
         }
 
-        let tables = detect_tables(&items, 10.0);
+        let tables = detect_tables(&items, 10.0, false);
         assert_eq!(tables.len(), 1, "Large data table should not be rejected");
         assert!(
             tables[0].rows.len() >= 40,
@@ -1599,7 +1713,7 @@ mod tests {
             items.push(make_item(&format!("${},000", 100 + i * 10), 350.0, y, 8.0));
         }
 
-        let tables = detect_tables(&items, 12.0);
+        let tables = detect_tables(&items, 12.0, false);
         assert_eq!(tables.len(), 1, "Should detect one table");
         // 1 header + 7 data = 8 rows total; must NOT merge into 4
         assert_eq!(

@@ -206,7 +206,7 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
             }
         }
 
-        let tables = detect_tables(&page_items, base_size);
+        let tables = detect_tables(&page_items, base_size, false);
 
         for table in tables {
             // Mark items as belonging to a table using pre-computed global indices
