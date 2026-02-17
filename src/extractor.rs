@@ -3031,38 +3031,46 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
             }
 
             // Process spanning items as their own group
-            let mut spanning_lines = group_single_column(spanning_items);
+            let spanning_lines = group_single_column(spanning_items);
 
-            // Sort spanning lines by Y descending (top-first in PDF coords)
-            spanning_lines
-                .sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Section-based merge: spanning items define vertical sections.
-            // Within each section, emit all column lines (left-to-right, top-to-bottom)
-            // before emitting the spanning line.
-            let mut merged: Vec<TextLine> = Vec::new();
-            let mut col_cursors: Vec<usize> = vec![0; per_column_lines.len()];
-
-            for span_line in &spanning_lines {
-                let span_y = span_line.y;
-                // Emit all column lines above this spanning line, column by column
-                for (ci, col_lines) in per_column_lines.iter().enumerate() {
-                    while col_cursors[ci] < col_lines.len()
-                        && col_lines[col_cursors[ci]].y >= span_y
-                    {
-                        merged.push(col_lines[col_cursors[ci]].clone());
-                        col_cursors[ci] += 1;
-                    }
-                }
-                merged.push(span_line.clone());
+            // Y-interleaved merge: combine all column lines and spanning lines,
+            // sort by Y position, and merge lines at the same Y from different
+            // columns into a single line. This correctly handles both tabular
+            // layouts (where rows span columns) and newspaper-style columns.
+            let mut all_page_lines: Vec<TextLine> = Vec::new();
+            all_page_lines.extend(spanning_lines);
+            for col_lines in per_column_lines {
+                all_page_lines.extend(col_lines);
             }
 
-            // Emit remaining column lines below all spanning items, column by column
-            for (ci, col_lines) in per_column_lines.iter().enumerate() {
-                while col_cursors[ci] < col_lines.len() {
-                    merged.push(col_lines[col_cursors[ci]].clone());
-                    col_cursors[ci] += 1;
+            // Sort by Y descending (top-first), then by X for same-Y lines
+            all_page_lines.sort_by(|a, b| {
+                b.y.partial_cmp(&a.y)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(
+                        a.items
+                            .first()
+                            .map(|i| i.x)
+                            .unwrap_or(0.0)
+                            .partial_cmp(&b.items.first().map(|i| i.x).unwrap_or(0.0))
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+            });
+
+            // Merge lines at the same Y (within tolerance) into single lines
+            let y_tol = 3.0;
+            let mut merged: Vec<TextLine> = Vec::new();
+            for line in all_page_lines {
+                if let Some(last) = merged.last_mut() {
+                    if last.page == line.page && (last.y - line.y).abs() < y_tol {
+                        last.items.extend(line.items);
+                        last.items.sort_by(|a, b| {
+                            a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        continue;
+                    }
                 }
+                merged.push(line);
             }
 
             all_lines.extend(merged);
