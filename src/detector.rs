@@ -97,26 +97,16 @@ pub fn detect_pdf_type_with_config<P: AsRef<Path>>(
 ) -> Result<PdfTypeResult, PdfError> {
     crate::validate_pdf_file(&path)?;
 
-    // First, load metadata only (fast operation)
-    let metadata = match Document::load_metadata(&path) {
-        Ok(m) => m,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_metadata_with_password(&path, "")?
-        }
-        Err(e) => return Err(e.into()),
-    };
-
-    // Then load the full document for content inspection
-    // We use filtered loading to skip heavy objects we don't need
-    let doc = match Document::load(&path) {
+    let buffer = std::fs::read(&path)?;
+    let doc = match Document::load_mem(&buffer) {
         Ok(d) => d,
         Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_with_password(&path, "")?
+            Document::load_mem_with_options(&buffer, lopdf::LoadOptions::with_password(""))?
         }
         Err(e) => return Err(e.into()),
     };
-
-    detect_from_document(&doc, metadata.page_count, &config)
+    let page_count = doc.get_pages().len() as u32;
+    detect_from_document(&doc, page_count, &config)
 }
 
 /// Detect PDF type from memory buffer
@@ -131,15 +121,6 @@ pub fn detect_pdf_type_mem_with_config(
 ) -> Result<PdfTypeResult, PdfError> {
     crate::validate_pdf_bytes(buffer)?;
 
-    // Load metadata first (fast)
-    let metadata = match Document::load_metadata_mem(buffer) {
-        Ok(m) => m,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_metadata_mem_with_password(buffer, "")?
-        }
-        Err(e) => return Err(e.into()),
-    };
-
     // Load document for inspection
     let doc = match Document::load_mem(buffer) {
         Ok(d) => d,
@@ -148,13 +129,13 @@ pub fn detect_pdf_type_mem_with_config(
         }
         Err(e) => return Err(e.into()),
     };
-
-    detect_from_document(&doc, metadata.page_count, &config)
+    let page_count = doc.get_pages().len() as u32;
+    detect_from_document(&doc, page_count, &config)
 }
 
 /// Detection logic on a pre-loaded document.
 ///
-/// `page_count` should come from `Document::load_metadata()`.
+/// `page_count` should come from `doc.get_pages().len()`.
 pub(crate) fn detect_from_document(
     doc: &Document,
     page_count: u32,
