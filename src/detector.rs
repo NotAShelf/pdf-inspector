@@ -105,6 +105,12 @@ pub fn detect_pdf_type_with_config<P: AsRef<Path>>(
         }
         Err(e) => return Err(e.into()),
     };
+
+    // Note: unlike load_document_from_mem in lib.rs, this path does not apply
+    // structure_tree::fix_bare_struct_names preprocessing. Detection doesn't inspect
+    // struct tree roles, so this asymmetry has no practical effect.
+    //
+    // See: <https://github.com/firecrawl/pdf-inspector/pull/34#pullrequestreview-4117304193>
     let page_count = doc.get_pages().len() as u32;
     detect_from_document(&doc, page_count, &config)
 }
